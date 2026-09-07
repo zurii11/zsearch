@@ -11,6 +11,7 @@ HEIGHT :: 300
 WIDTH :: 1200
 MAX_CHARS :: 20
 FONT_SIZE_STEP :: 4
+DRAW_WINDOW :: false
 
 WindowState :: struct {
 	font_size:            c.int,
@@ -46,12 +47,46 @@ MFT_ENUM_DATA_V0 :: struct {
 File_Entry :: struct {
 	file_id:   u64,
 	parent_id: u64,
-	name:      string, // points to a place in the string pool
+	name:      String_H, // points to a place in the string pool
 }
 
 Search_Index :: struct {
 	files: [dynamic]File_Entry,
 	names: [dynamic]u8,
+}
+
+String_H :: struct {
+	offset: int,
+	len:    int,
+}
+
+string_from_handle :: proc(handle: String_H, buffer: []u8) -> string {
+	return string(buffer[handle.offset:handle.offset + handle.len])
+}
+
+/*
+return true if the whole query found
+in the exact order in the target.
+*/
+fuzzy_search :: proc(target: string, query: string) -> bool {
+	if len(query) == 0 do return false
+	if len(target) < len(query) do return false
+
+	t_ind := 0
+	q_ind := 0
+
+	for t_ind < len(target) && q_ind < len(query) {
+		t_char: u8 = target[t_ind]
+		q_char: u8 = query[q_ind]
+
+		if t_char == q_char {
+			q_ind += 1
+		}
+
+		t_ind += 1
+	}
+
+	return len(query) == q_ind
 }
 
 control_keys :: proc(ws: ^WindowState) {
@@ -115,7 +150,10 @@ load_disk :: proc(index: ^Search_Index) {
 	bytes_total: u32
 	record_count: u32 = 0
 	first_tick := time.tick_now()
-	index_names_offset := 0
+	//index_names_offset := 0
+
+	//reserve(&index.names, 64 * 1024 * 1024)
+	//reserve(&index.files, 1000000)
 
 	for {
 		ok := windows.DeviceIoControl(
@@ -149,10 +187,16 @@ load_disk :: proc(index: ^Search_Index) {
 			file_entry.file_id = record.FileReferenceNumber
 			file_entry.parent_id = record.ParentFileReferenceNumber
 
+			start_idx := len(index.names)
+
 			append(&index.names, ..transmute([]u8)name_odin)
-			file_entry.name = cast(string)index.names[index_names_offset:index_names_offset +
-			int(name_len)]
-			index_names_offset += int(name_len)
+
+			end_idx := len(index.names)
+
+			file_entry.name = String_H {
+				offset = start_idx,
+				len    = end_idx - start_idx,
+			}
 
 			append(&index.files, file_entry)
 
@@ -187,56 +231,67 @@ main :: proc() {
 	defer delete(index.names)
 	load_disk(&index)
 
-	ws := init_window_state()
+	for i in 0 ..< len(index.files) {
+		file_entry := index.files[i]
+		if fuzzy_search(string_from_handle(file_entry.name, index.names[:]), "bashrc") {
+			fmt.printfln("file id: %d", file_entry.file_id)
+			fmt.printfln("file name: %s", index.names[file_entry.name.offset])
+		}
+	}
+	fmt.printfln("GOT HERE!")
+
+	if DRAW_WINDOW {
+		ws := init_window_state()
 
 
-	r.SetConfigFlags({.WINDOW_UNDECORATED})
-	r.InitWindow(WIDTH, HEIGHT, "Search")
+		r.SetConfigFlags({.WINDOW_UNDECORATED})
+		r.InitWindow(WIDTH, HEIGHT, "Search")
 
-	font := r.GetFontDefault()
-	spacing := f32(2)
+		font := r.GetFontDefault()
+		spacing := f32(2)
 
-	for !r.WindowShouldClose() {
-		control_keys(&ws)
+		for !r.WindowShouldClose() {
+			control_keys(&ws)
 
-		key: rune = r.GetCharPressed()
+			key: rune = r.GetCharPressed()
 
-		for key > 0 {
-			if len(ws.input_string_builder.buf) < MAX_CHARS {
-				strings.write_rune(&ws.input_string_builder, key)
-				ws.cursor_index += 1
+			for key > 0 {
+				if len(ws.input_string_builder.buf) < MAX_CHARS {
+					strings.write_rune(&ws.input_string_builder, key)
+					ws.cursor_index += 1
+				}
+				key = r.GetCharPressed()
 			}
-			key = r.GetCharPressed()
+
+
+			r.BeginDrawing()
+
+			r.ClearBackground(r.Color{0x2b, 0x36, 0x3a, 0xFF})
+
+			current_str: string = strings.to_string(ws.input_string_builder)
+			current_cstr: cstring = strings.clone_to_cstring(current_str, context.temp_allocator)
+			r.DrawTextEx(font, current_cstr, {50, 50}, f32(ws.font_size), spacing, r.WHITE)
+
+			text_size: r.Vector2 = r.MeasureTextEx(
+				font,
+				strings.clone_to_cstring(current_str[:ws.cursor_index]),
+				f32(ws.font_size),
+				spacing,
+			)
+			r.DrawLineEx(
+				{50 + text_size.x + 4, 50},
+				{50 + text_size.x + 4, 50 + text_size.y},
+				f32(4),
+				r.BLACK,
+			)
+
+
+			r.EndDrawing()
+
+			free_all(context.temp_allocator)
 		}
 
-
-		r.BeginDrawing()
-
-		r.ClearBackground(r.Color{0x2b, 0x36, 0x3a, 0xFF})
-
-		current_str: string = strings.to_string(ws.input_string_builder)
-		current_cstr: cstring = strings.clone_to_cstring(current_str, context.temp_allocator)
-		r.DrawTextEx(font, current_cstr, {50, 50}, f32(ws.font_size), spacing, r.WHITE)
-
-		text_size: r.Vector2 = r.MeasureTextEx(
-			font,
-			strings.clone_to_cstring(current_str[:ws.cursor_index]),
-			f32(ws.font_size),
-			spacing,
-		)
-		r.DrawLineEx(
-			{50 + text_size.x + 4, 50},
-			{50 + text_size.x + 4, 50 + text_size.y},
-			f32(4),
-			r.BLACK,
-		)
-
-
-		r.EndDrawing()
-
-		free_all(context.temp_allocator)
+		r.CloseWindow()
 	}
-
-	r.CloseWindow()
 
 }
