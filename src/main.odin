@@ -7,6 +7,15 @@ import "core:sys/windows"
 import "core:time"
 import r "vendor:raylib"
 
+foreign import kernel32 "system:kernel32.lib"
+
+@(default_calling_convention = "system")
+foreign kernel32 {
+	GetLogicalDrives :: proc() -> u32 ---
+	GetDriveTypeW :: proc(lpRootPathName: windows.LPCWSTR) -> u32 ---
+}
+
+DRIVE_FIXED :: 3
 HEIGHT :: 300
 WIDTH :: 1200
 MAX_CHARS :: 20
@@ -48,11 +57,18 @@ File_Entry :: struct {
 	file_id:   u64,
 	parent_id: u64,
 	name:      String_H, // points to a place in the string pool
+	drive_id:  u8,
+}
+
+Drive_And_File :: struct {
+	drive_id: u8,
+	file_id:  u64,
 }
 
 Search_Index :: struct {
-	files: [dynamic]File_Entry,
-	names: [dynamic]u8,
+	files:     [dynamic]File_Entry,
+	names:     [dynamic]u8,
+	id_to_ind: map[Drive_And_File]int,
 }
 
 String_H :: struct {
@@ -68,10 +84,13 @@ string_from_handle :: proc(handle: String_H, buffer: []u8) -> string {
 return true if the whole query found
 in the exact order in the target.
 */
-fuzzy_search :: proc(target: string, query: string) -> bool {
-	if len(query) == 0 do return false
-	if len(target) < len(query) do return false
+fuzzy_search :: proc(target: string, query: string) -> f32 {
+	if len(query) == 0 do return 0
+	if len(target) < len(query) do return 0
 
+	score: f32 = 0
+	slices: int = 0
+	matched: bool = false
 	t_ind := 0
 	q_ind := 0
 
@@ -81,12 +100,23 @@ fuzzy_search :: proc(target: string, query: string) -> bool {
 
 		if t_char == q_char {
 			q_ind += 1
+
+			if matched == false {
+				matched = true
+				slices += 1
+			}
+		} else if matched == true {
+			matched = false
 		}
 
 		t_ind += 1
 	}
 
-	return len(query) == q_ind
+	if len(query) == q_ind {
+		score = f32(len(query)) / f32(len(target)) / f32(slices)
+	}
+
+	return score
 }
 
 control_keys :: proc(ws: ^WindowState) {
@@ -121,9 +151,41 @@ init_window_state :: proc() -> WindowState {
 	return WindowState{48, strings.builder_make(), 0}
 }
 
-load_disk :: proc(index: ^Search_Index) {
+get_all_drives :: proc(allocator := context.temp_allocator) -> [dynamic]u8 {
+	drive_letters := make([dynamic]u8, allocator)
+	drive_mask := GetLogicalDrives()
+
+	for i in 0 ..< 26 {
+		if (drive_mask & (1 << u32(i))) > 0 {
+			append(&drive_letters, u8('A' + i))
+		}
+	}
+
+	return drive_letters
+}
+
+get_fixed_drives :: proc(allocator := context.temp_allocator) -> [dynamic]u8 {
+	all_drives := get_all_drives()
+	fixed_drives := make([dynamic]u8, allocator)
+
+	for drive in all_drives {
+		root_path := [4]u16{u16(drive), ':', '\\', 0}
+
+		drive_type := GetDriveTypeW(&root_path[0])
+
+		if drive_type == DRIVE_FIXED {
+			append(&fixed_drives, drive)
+		}
+	}
+
+	return fixed_drives
+}
+
+load_drive :: proc(index: ^Search_Index, drive_letter: u8) {
+	lpFileName := [7]u16{'\\', '\\', '.', '\\', u16(drive_letter), ':', 0}
+
 	hd := windows.CreateFileW(
-		windows.L("\\\\.\\C:"),
+		&lpFileName[0], //windows.L("\\\\.\\C:"),
 		windows.GENERIC_READ,
 		windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE,
 		nil,
@@ -174,6 +236,7 @@ load_disk :: proc(index: ^Search_Index) {
 		next_id := (^u64)(&buffer[0])^
 		//fmt.printfln("NEXT ID: %p", next_id)
 
+		// first 8 bytes of FSCTL_ENUM_USN_DATA is USN identifier
 		offset := u32(8)
 		for offset < bytes_returned {
 			record := (^USN_RECORD_V2)(&buffer[offset])
@@ -186,6 +249,7 @@ load_disk :: proc(index: ^Search_Index) {
 			file_entry := File_Entry{}
 			file_entry.file_id = record.FileReferenceNumber
 			file_entry.parent_id = record.ParentFileReferenceNumber
+			file_entry.drive_id = drive_letter
 
 			start_idx := len(index.names)
 
@@ -199,6 +263,11 @@ load_disk :: proc(index: ^Search_Index) {
 			}
 
 			append(&index.files, file_entry)
+			dnf := Drive_And_File {
+				drive_id = drive_letter,
+				file_id  = file_entry.file_id,
+			}
+			index.id_to_ind[dnf] = len(index.files) - 1
 
 			offset += record.RecordLength
 			record_count += 1
@@ -222,6 +291,53 @@ load_disk :: proc(index: ^Search_Index) {
 	fmt.printfln("Random File Name: %s", index.files[26412].name)
 }
 
+load_fixed_drives :: proc(index: ^Search_Index) {
+	fixed_drives := get_fixed_drives()
+
+	for drive in fixed_drives {
+		load_drive(index, drive)
+	}
+}
+
+reconstruct_full_path :: proc(
+	index: ^Search_Index,
+	file_entry: File_Entry,
+	allocator := context.temp_allocator,
+) -> string {
+	segments := make([dynamic]string, allocator)
+
+	current := file_entry
+	for {
+		segment_name := string_from_handle(current.name, index.names[:])
+		append(&segments, segment_name)
+
+		if current.parent_id == 0 do break
+		if current.parent_id == current.file_id do break
+
+		dnf := Drive_And_File {
+			drive_id = current.drive_id,
+			file_id  = current.parent_id,
+		}
+		parent_ind, found := index.id_to_ind[dnf]
+		if !found do break
+
+		current = index.files[parent_ind]
+	}
+
+	builder := strings.builder_make(allocator)
+	fmt.sbprintf(&builder, "%c:", file_entry.drive_id)
+
+	#reverse for segment, i in segments {
+		strings.write_string(&builder, segment)
+
+		if i > 0 {
+			strings.write_string(&builder, "/")
+		}
+	}
+
+	return strings.to_string(builder)
+}
+
 main :: proc() {
 
 	index := Search_Index{}
@@ -229,13 +345,15 @@ main :: proc() {
 	defer delete(index.files)
 	index.names = make([dynamic]u8)
 	defer delete(index.names)
-	load_disk(&index)
+	load_fixed_drives(&index)
 
 	for i in 0 ..< len(index.files) {
 		file_entry := index.files[i]
-		if fuzzy_search(string_from_handle(file_entry.name, index.names[:]), "bashrc") {
+		file_score := fuzzy_search(string_from_handle(file_entry.name, index.names[:]), "bashrc")
+		if file_score > 0.5 {
+			fmt.printfln("file score: %f", file_score)
 			fmt.printfln("file id: %d", file_entry.file_id)
-			fmt.printfln("file name: %s", index.names[file_entry.name.offset])
+			fmt.printfln("file name: %s", reconstruct_full_path(&index, file_entry))
 		}
 	}
 	fmt.printfln("GOT HERE!")
